@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import torch.nn as nn
 
 
 
@@ -7,7 +8,7 @@ def replace_layers(model, i, indexes, layers):
     if i in indexes:
         return layers[indexes.index(i)]
     return model[i]
-def prune_layer(model, layer_index, filter_index, conv_flag=True):
+def prune_layer(model, layer_index, filter_index, conv_flag=True, batchnorm=False):
     use_cuda = torch.cuda.is_available()
     if conv_flag:
         conv = model.features[layer_index]
@@ -28,7 +29,7 @@ def prune_layer(model, layer_index, filter_index, conv_flag=True):
                 dilation = conv.dilation,
                 groups = conv.groups,
                 bias = (conv.bias is not None))
-
+        
         old_weights = conv.weight.data.cpu().numpy()
         new_weights = new_conv.weight.data.cpu().numpy()
 
@@ -44,6 +45,25 @@ def prune_layer(model, layer_index, filter_index, conv_flag=True):
         new_conv.bias.data = torch.from_numpy(bias)
         if use_cuda:
             new_conv.bias.data = new_conv.bias.data.cuda()
+        
+        if batchnorm:
+            batch = model.features[layer_index + 1]
+            new_batch = torch.nn.BatchNorm2d(batch.num_features - 1)
+            with torch.no_grad():
+                new_batch.weight = nn.Parameter(torch.cat(\
+                (batch.weight[:filter_index], batch.weight[filter_index+1:])))
+                new_batch.bias = nn.Parameter(torch.cat(\
+                (batch.bias[:filter_index], batch.bias[filter_index+1:])))
+                new_batch.running_mean = torch.cat(\
+                (batch.running_mean[:filter_index], batch.running_mean[filter_index+1:]))
+                new_batch.running_var = torch.cat(\
+                (batch.running_var[:filter_index], batch.running_var[filter_index+1:]))
+            if use_cuda:
+                new_batch = new_batch.cuda()
+            
+            
+            
+        
         if not next_conv is None:
             next_new_conv = \
                 torch.nn.Conv2d(in_channels = next_conv.in_channels - 1,\
@@ -65,19 +85,29 @@ def prune_layer(model, layer_index, filter_index, conv_flag=True):
                 next_new_conv.weight.data = next_new_conv.weight.data.cuda()
             next_new_conv.bias.data = next_conv.bias.data
         if not next_conv is None:
+            indexes = [layer_index, layer_index+offset]
+            layy = [new_conv, next_new_conv]
+            if batchnorm:
+                indexes.append(layer_index+1)
+                layy.append(new_batch)
             features = torch.nn.Sequential(
-                    *(replace_layers(model.features, i, [layer_index, layer_index+offset], \
-                        [new_conv, next_new_conv]) for i, _ in enumerate(model.features)))
+                    *(replace_layers(model.features, i, indexes, \
+                        layy) for i, _ in enumerate(model.features)))
             del model.features
             del conv
-
             model.features = features
-
         else:
             #Prunning the last conv layer. This affects the first linear layer of the classifier.
-            model.features = torch.nn.Sequential(
-                    *(replace_layers(model.features, i, [layer_index], \
-                        [new_conv]) for i, _ in enumerate(model.features)))
+            indexes = [layer_index]
+            layy = [new_conv]
+            if batchnorm:
+                indexes.append(layer_index+1)
+                layy.append(new_batch)
+            features = torch.nn.Sequential(
+                    *(replace_layers(model.features, i, indexes, \
+                        layy) for i, _ in enumerate(model.features)))
+            del model.features
+            model.features = features
             layer_index = 0
             old_linear_layer = None
             for module in model.classifier:
